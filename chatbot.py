@@ -9,7 +9,7 @@ load_dotenv()
 
 # Configurações
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-OPENROUTER_API_KEY = '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'  # Chave da OpenRouter
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Chave da OpenRouter guardada em um arquivo .env pra segurança
 OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'  # Endpoint do OpenRouter
 
 # Verifica se as variáveis de ambiente foram carregadas
