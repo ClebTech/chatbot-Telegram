@@ -1,27 +1,53 @@
-import os
-from dotenv import load_dotenv
-import aiohttp
+import os #manipulação de arquivos e diretos do linux, acessar variaveis de ambiente
+import re #manipulação de strings, busca de padrões e etc (extrair itens de pedidos de mensagens)
+import json #para ensinar a IA sobre o cardapio
+
+from dotenv import load_dotenv #importa as variaveis de ambiente (chaves API)
+
+import aiohttp #requisições HTTP assíncronas
+
+#manipulação de dados (usado no arquivo de gírias)
+import pandas as pd
+
+#biblioteca para integração com chatbot do Telegram
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Carrega as variáveis de ambiente
+
+#possiveis estados do pedido até a finalização (para o bot saber onde está)
+(
+    AGUARDANDO_PEDIDO,
+    AGUARDANDO_ENDERECO,
+    AGUARDANDO_PAGAMENTO,
+    PEDIDO_CONCLUIDO,
+    PEDIDO_EM_PREPARO
+) = range(5)
+
+# Carregando as variáveis de ambiente do arquivo .env
 load_dotenv()
-
-# Configurações
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Chave da OpenRouter guardada em um arquivo .env pra segurança
-OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'  # Endpoint do OpenRouter
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
-# Verifica se as variáveis de ambiente foram carregadas
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("A variável de ambiente TELEGRAM_BOT_TOKEN deve ser definida no arquivo .env.")
+# Carregando a base de dados com gírias (tenta carregar o arquivo e criar um dicionario a partir dele pro chatbot)
+try:
+    df_girias = pd.read_csv('girias.csv')
+    girias_dict = {
+        row['giria'].lower(): {
+            'significado': row['significado'],
+            'exemplo_uso': row['exemplo_de_uso']
+        } for _, row in df_girias.iterrows()
+    }
+except:
+    print("Erro ao carregar as gírias")
+    girias_dict = {}
 
-# Cardápio da lanchonete
+############cardapio de itens
 cardapio = {
     "hambúrgueres": [
-        {"nome": "Hambúrguer Python", "preco": 15.00},
+        {"nome": "Hambúrguer Python", "preco": 15.40},
         {"nome": "Hambúrguer Java", "preco": 18.00},
-        {"nome": "Hambúrguer PHP", "preco": 16.00}
+        {"nome": "Hambúrguer PHP", "preco": 16.30}
     ],
     "pizzas": [
         {"nome": "Pizza de C#", "preco": 35.00},
@@ -29,156 +55,348 @@ cardapio = {
         {"nome": "Pizza de HTML com CSS", "preco": 38.00}
     ],
     "saladas": [
-        {"nome": "Salada de Memória RAM", "preco": 12.00},
+        {"nome": "Salada de Memória RAM", "preco": 12.30},
         {"nome": "Salada de Pen-Drives", "preco": 10.00},
         {"nome": "Salada de Software", "preco": 8.00}
     ],
     "bebidas": [
-        {"nome": "Refrigerante SQL", "preco": 5.00},
+        {"nome": "Refrigerante SQL", "preco": 5.50},
         {"nome": "Suco Natural de Linux", "preco": 7.00},
         {"nome": "Água Mineral", "preco": 3.00}
+    ],
+    "salgados": [
+        {"nome": "Pão de Queijo", "preco": 5.00},
+        {"nome": "Sanduíche de Presunto", "preco": 7.20},
+        {"nome": "Bolo de Milho", "preco": 9.50}
     ]
 }
 
-# Função para formatar o cardápio
+#funções auxiliares
+######mostra o cardapio formatado bonitinho
 def formatar_cardapio():
-    cardapio_formatado = "🍔 **Cardápio da Lanchonete** 🍕\n\n"
+    msg = "===== Cardápio da BSI Lanches ===== \n\n"
     for categoria, itens in cardapio.items():
-        cardapio_formatado += f"**{categoria.capitalize()}:**\n"
+        msg += f"=={categoria.capitalize()}:==\n"
         for item in itens:
-            cardapio_formatado += f"- {item['nome']}: R$ {item['preco']:.2f}\n"
-        cardapio_formatado += "\n"
-    return cardapio_formatado
+            msg += f"- {item['nome']}: R$ {item['preco']:.2f}\n"
+        msg += "\n"
+    msg += "[!] Certifique-se de escrever o nome do pedido *exatamente* como está no cardápio para que eu reconheça certinho, beleza?\n\nEXEMPLO: 2x pão de queijo, 1x refrigerante SQL"
+    return msg
 
-# Função para calcular o valor total do pedido
+####calcula o valor total do pedido (itens + cupons + entrega)
 def calcular_total(pedido, cupom_valido=False):
-    taxa_entrega = 3.00  # Taxa de entrega fixa
-    subtotal = sum(item['preco'] for item in pedido)  # Soma os preços dos itens
-    
-    if cupom_valido:
-        desconto = subtotal * 0.20  # 20% de desconto
-    else:
-        desconto = 0.00
-    
+    taxa_entrega = 3.00
+    subtotal = sum(item['preco'] for item in pedido)
+    desconto = subtotal * 0.20 if cupom_valido else 0.0
     total = subtotal - desconto + taxa_entrega
     return subtotal, desconto, taxa_entrega, total
 
-# Função para interagir com a API do OpenRouter
-async def get_openrouter_response(conversation_history):
+#####verifica se a mensagem do usuario tem gírias do dicionario, para adaptar o tom de conversa
+def detectar_giria(mensagem):
+    mensagem = mensagem.lower()
+    for giria in girias_dict.keys():
+        if giria in mensagem:
+            return True
+    return False
+
+####extrai os itens do pedido do usuario, o nome do pedido (e se é valido) a quantidade... usando a lib re
+def extrair_itens_do_pedido(mensagem):
+    mensagem = mensagem.lower()
+    itens_identificados = []
+    contagem_itens = {}
+
+    # Padrão para encontrar quantidades e itens (ex: "2x hambúrguer python" ou "3 pizza de c#")
+    padrao_quantidade = r"(\d+)\s*(?:x\s*)?([^\d,;.]+?)(?=\d|,|;|\.|$)"
+    matches = re.finditer(padrao_quantidade, mensagem)
+    
+    for match in matches:
+        quantidade = int(match.group(1))
+        item_pedido = match.group(2).strip()
+        
+        # Verifica se o item existe no cardápio
+        item_encontrado = None
+        for categoria, itens in cardapio.items():
+            for item in itens:
+                if item['nome'].lower() in item_pedido:
+                    item_encontrado = item
+                    break
+            if item_encontrado:
+                break
+        
+        if item_encontrado:
+            nome_item = item_encontrado['nome']
+            if nome_item in contagem_itens:
+                contagem_itens[nome_item] += quantidade
+            else:
+                contagem_itens[nome_item] = quantidade
+            for _ in range(quantidade):
+                itens_identificados.append(item_encontrado)
+    
+    #tbm verifica itens sem quantidade indicada (ent assume q é 1 item)
+    for categoria, itens in cardapio.items():
+        for item in itens:
+            nome_item = item['nome'].lower()
+            nome_item_cardapio = item['nome']
+            ### se o item for mencionado sem quantidade e não foi capturado pelo padrão anterior
+            if (nome_item in mensagem and 
+                not any(nome_item in match.group(2).lower() for match in re.finditer(padrao_quantidade, mensagem))):
+                if nome_item_cardapio in contagem_itens:
+                    contagem_itens[nome_item_cardapio] += 1
+                else:
+                    contagem_itens[nome_item_cardapio] = 1
+                itens_identificados.append(item)
+    
+    return itens_identificados, contagem_itens
+    
+####atualiza o modo de fala com base no contexto e na mensagem recebida do useario
+def atualizar_modo_de_fala(context, mensagem):
+    usa_giria = detectar_giria(mensagem)
+    modo_atual = context.user_data.get('modo_fala')
+    novo_modo = 'girias' if usa_giria else 'formal'
+    if modo_atual != novo_modo:
+        context.user_data['modo_fala'] = novo_modo
+        prompt = definir_prompt(novo_modo)
+        context.user_data['conversation_history'] = [{"role": "system", "content": prompt}]
+    return novo_modo
+
+####prompt para a API da openrouter entender como agir
+def definir_prompt(modo_fala):
+    cardapio_json = json.dumps(cardapio, ensure_ascii=False, indent=2)
+    if modo_fala == 'girias':
+        prompt = """Você é o Clebinho, atendente da lanchonete BSI. Fale sempre usando gírias.
+- Atenda de forma divertida e informal, como um atendente camarada.
+- Se perguntarem sobre o cardápio, mostre os itens disponíveis.
+- Para pedidos, ajude o usuário a montar o pedido com base no cardápio.
+- Sobre entrega: diga que o entregador se chama Wallan e o prazo é de 30 minutos.
+- Responda apenas em Português. Se o usuário falar qualquer coisa em outro idioma, diga exatamente essa mensagem, do exato jeito que está: "Sorry, I only speak portuguese!", mesmo que esse idioma seja o inglês.
+"""
+        for giria, dados in girias_dict.items():
+            prompt += f"- {giria}: {dados['significado']} (ex: {dados['exemplo_uso']})\n"
+    else:
+        prompt = """Você é o Clebinho, atendente da lanchonete BSI. Seja educado, simpático e claro nas respostas.
+- Se perguntarem sobre o cardápio, mostre os itens disponíveis.
+- Para pedidos, ajude o usuário a montar o pedido com base no cardápio.
+- Sobre entrega: diga que o entregador se chama Wallan e o prazo é de 30 minutos.
+- Responda apenas em Português. Se o usuário falar qualquer coisa em outro idioma, diga exatamente essa mensagem, do exato jeito que está: "Sorry, I only speak portuguese!", mesmo que esse idioma seja o inglês.
+"""
+
+    prompt += "\n\nCardápio disponível:\n" + cardapio_json ###############ensinando a API q itens temos no cardapio
+    return prompt
+
+#########obtendo resposta da API da openrouter para as msg
+async def get_openrouter_response(history):
     headers = {
-        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-        'Content-Type': 'application/json'
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
     }
     data = {
-        "model": "openai/gpt-3.5-turbo",  # Modelo escolhido
-        "messages": conversation_history,
-        "max_tokens": 150
+        "model": "openai/gpt-3.5-turbo",
+        "messages": history
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OPENROUTER_API_URL, headers=headers, json=data) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result['choices'][0]['message']['content'].strip()
-                else:
-                    return f"Erro na API: {response.status} - {await response.text()}"
-    except Exception as e:
-        return f"Erro ao processar a mensagem: {str(e)}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OPENROUTER_API_URL, headers=headers, json=data) as resp:
+            response_json = await resp.json()
+            return response_json['choices'][0]['message']['content']
 
-# Comando de início
+###############comandos do bot
+#start para iniciar a conversa
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Olá! Eu sou o Clebinho, atendente virtual da lanchonete "BSI Lanches". Como posso ajudar?')
+    await update.message.reply_text("Olá! Eu sou o Clebinho, o atendente da BSI Lanches. Manda o papo!")
 
-# Manipulador de mensagens
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text.lower()  # Converte a mensagem para minúsculas
+    user_message = update.message.text.lower()
+    modo_fala = atualizar_modo_de_fala(context, user_message)
+    estado_atual = context.user_data.get('estado_pedido', AGUARDANDO_PEDIDO)
 
-    # Verifica se o usuário está perguntando sobre o cardápio
-    if "cardápio" in user_message or "o que vocês servem" in user_message or "cardapio" in user_message:
-        cardapio_formatado = formatar_cardapio()
-        await update.message.reply_text(cardapio_formatado, parse_mode="Markdown")
+    #se estiver no estado de pedido em preparo
+    if estado_atual == PEDIDO_EM_PREPARO:
+        if any(p in user_message for p in ["vai demorar", "quanto tempo", "já vai sair", "está pronto", "pronto", "andamento", "como está", "status", "tá pronto"]):
+            respostas_possiveis = [
+                "Tá saindo agora mesmo, chefia! O Wallan já tá quase saindo pra entrega!",
+                "Não vai demorar não, meu parceiro! Já tá tudo quase pronto!",
+                "Seu pedido tá na reta final! Só aguardar mais um pouquinho! ",
+                "Já tá tudo prontinho aqui, só esperando o Wallan pegar pra levar!",
+                "Relaxa que já tá quase saindo! O cozinheiro tá só dando aquela caprichada final!"
+            ]
+            import random #######lib para pegar uma resposta aleatoria e mostrar pro usario ansioso kk
+            resposta = random.choice(respostas_possiveis)
+            await update.message.reply_text(resposta)
+            return
+        
+        if any(p in user_message for p in ["meu pedido", "pedido", "lanche", "comida"]):
+            await update.message.reply_text("Seu pedido continua em preparo! Qualquer novidade eu te aviso! ")
+            return
+        
+        #se não for sobre o pedido, ent volta ao estado normal (p/ poder fazer outro pedido)
+        context.user_data['estado_pedido'] = AGUARDANDO_PEDIDO
+
+    #se estiver esperando endereço (estado do pedido)
+    if estado_atual == AGUARDANDO_ENDERECO:
+        context.user_data['endereco'] = update.message.text
+        await update.message.reply_text("Ótimo! Agora, qual será a forma de pagamento?\n\nOpções:\n- Dinheiro\n- Cartão de Crédito\n- Cartão de Débito\n- PIX")
+        context.user_data['estado_pedido'] = AGUARDANDO_PAGAMENTO
+        return
+    
+    #se estiver esperando forma de pagamento (estado do pedido)
+    if estado_atual == AGUARDANDO_PAGAMENTO:
+        formas_validas = ['dinheiro', 'cartão de crédito', 'cartão de débito', 'pix', 'credito', 'debito']
+        if any(f in user_message for f in formas_validas):
+            # Normaliza a forma de pagamento
+            if 'dinheiro' in user_message:
+                forma_pagamento = 'Dinheiro'
+            elif 'débito' in user_message or 'debito' in user_message:
+                forma_pagamento = 'Cartão de Débito'
+            elif 'crédito' in user_message or 'credito' in user_message:
+                forma_pagamento = 'Cartão de Crédito'
+            elif 'pix' in user_message:
+                forma_pagamento = 'PIX'
+            else:
+                forma_pagamento = user_message.capitalize()
+            
+            context.user_data['forma_pagamento'] = forma_pagamento
+            await mostrar_resumo_final(update, context)
+            context.user_data['estado_pedido'] = PEDIDO_EM_PREPARO
+        else:
+            await update.message.reply_text("Forma de pagamento inválida. Por favor, escolha entre:\n- Dinheiro\n- Cartão de Crédito\n- Cartão de Débito\n- PIX")
         return
 
-    # Verifica se o usuário está perguntando sobre o entregador
-    if "entregador" in user_message or "quem faz as entregas" in user_message or "quem entrega" in user_message:
+    #comandos normais do bot
+    ###chamar o cardapio
+    if any(p in user_message for p in ["cardápio", "cardapio", "menu", "comida", "o que tem", "tem o que", "me mostra o cardápio", "quero ver o cardápio",
+    "o que vocês têm", "o que vcs têm", "o que cês têm", "opções", "opcoes", "opçoes", "o que vendem", "quero ver as opções",
+    "quais os lanches", "mostra o menu", "qual o cardápio", "mostrar cardápio", "mostrar menu", "ver cardápio", "ver menu",
+    "tem lanche", "o que tem pra comer", "tem comida", "lanche", "lanchar", "refeição", "refeicoes", "refeições", "tem ai", "têm ai", "vendem", "variações", "variacoes"]):
+        await update.message.reply_text(formatar_cardapio(), parse_mode="Markdown")
+        return
+
+    if any(p in user_message for p in ["entregador", "quem entrega"]):
         await update.message.reply_text("Nosso entregador se chama Wallan. Ele é super rápido e cuidadoso! 🚴‍♂️")
         return
 
-    # Verifica se o usuário mencionou um cupom de desconto
     if "cupom" in user_message or "desconto" in user_message:
         if "fome20" in user_message:
             context.user_data['cupom_valido'] = True
-            await update.message.reply_text("Cupom FOME20 aplicado! Você ganhou 20% de desconto no seu pedido. 🎉")
+            await update.message.reply_text("Cupom FOME20 aplicado! Você ganhou 20% de desconto no seu pedido.")
         else:
-            await update.message.reply_text("Cupom inválido. 😕 O cupom válido é 'FOME20'.")
+            await update.message.reply_text("Cupom inválido. O cupom válido é 'FOME20'.")
         return
-
-    # Verifica se o usuário está finalizando o pedido
-    if "finalizar pedido" in user_message or "fechar pedido" in user_message:
+	
+	##para finalizar o pedido
+    if any(p in user_message for p in ["finalizar pedido", "fechar pedido", "finalizar", "concluir pedido", "quanto fica?", "quanto deu", 
+    "fechar a conta", "concluir", "encerrar pedido", "já escolhi", "quero finalizar", "quero fechar o pedido", 
+    "quero concluir", "fechar compra", "terminar pedido", "já fiz meu pedido", "terminar", "finaliza aí",
+    "fechou", "pode fechar", "pode concluir", "tá pronto", "está pronto", "finaliza pra mim", "quanto ficou"]):
         if 'pedido' not in context.user_data:
-            await update.message.reply_text("Você ainda não fez nenhum pedido. 😕")
+            await update.message.reply_text("Você ainda não fez nenhum pedido.")
             return
-
+        
+        #mostra o resumo do pedido e pede o endereço
         pedido = context.user_data['pedido']
         cupom_valido = context.user_data.get('cupom_valido', False)
         subtotal, desconto, taxa_entrega, total = calcular_total(pedido, cupom_valido)
-
-        resposta = (
-            "📝 **Resumo do Pedido:**\n\n"
-            f"**Itens:**\n"
-        )
+        
+        resposta = "**Resumo Parcial do Pedido:**\n\n**Itens:**\n"
+        contagem_pedido = {}
         for item in pedido:
-            resposta += f"- {item['nome']}: R$ {item['preco']:.2f}\n"
+            if item['nome'] in contagem_pedido:
+                contagem_pedido[item['nome']] += 1
+            else:
+                contagem_pedido[item['nome']] = 1
+        
+        for item, quantidade in contagem_pedido.items():
+            preco_item = next((i['preco'] for categoria in cardapio.values() for i in categoria if i['nome'] == item), 0)
+            resposta += f"- {quantidade}x {item}: R$ {preco_item:.2f} (R$ {preco_item * quantidade:.2f})\n"
         
         resposta += (
             f"\n**Subtotal:** R$ {subtotal:.2f}\n"
             f"**Desconto:** R$ {desconto:.2f}\n"
             f"**Taxa de Entrega:** R$ {taxa_entrega:.2f}\n"
             f"**Total:** R$ {total:.2f}\n\n"
-            "Obrigado pelo pedido! 🚴‍♂️"
+            "Por favor, me informe seu endereço para entrega:"
         )
-
+        
         await update.message.reply_text(resposta, parse_mode="Markdown")
+        context.user_data['estado_pedido'] = AGUARDANDO_ENDERECO
         return
 
-    # Verifica se o usuário está adicionando itens ao pedido
-    for categoria, itens in cardapio.items():
-        for item in itens:
-            if item['nome'].lower() in user_message:
-                if 'pedido' not in context.user_data:
-                    context.user_data['pedido'] = []
-                context.user_data['pedido'].append(item)
-                await update.message.reply_text(f"{item['nome']} adicionado ao pedido! 🛒")
-                return
+    #extração de itens do pedido
+    itens_mencionados, contagem_itens = extrair_itens_do_pedido(user_message)
+    if itens_mencionados:
+        if 'pedido' not in context.user_data:
+            context.user_data['pedido'] = []
+        context.user_data['pedido'].extend(itens_mencionados)
+        
+        mensagem_itens = []
+        for item, quantidade in contagem_itens.items():
+            mensagem_itens.append(f"{quantidade}x {item}")
+        
+        await update.message.reply_text(
+            f"{', '.join(mensagem_itens)} adicionados ao pedido!\n"
+            "Digite 'finalizar' para concluir o pedido."
+        )
+        return
 
-    # Se não for sobre o cardápio, entregador, cupom ou finalização, envia a mensagem para a API do OpenRouter
+    # cnversa normal com o chatbot
     if 'conversation_history' not in context.user_data:
-        context.user_data['conversation_history'] = [
-            {"role": "system", "content": "Você é um atendente virtual de uma lanchonete chamada 'BSI LANCHES', seu nome é Clebinho. Você é descontraído, amigável e entende gírias e expressões informais. Responda de forma natural, como se estivesse conversando com um amigo, mas mantenha o foco em ajudar com o cardápio e pedidos. Depois que o cliente solicitar o cardápio, você informa a ele o card que ele pode digitar 'finalizar' para receber o valor total do pedido, já incluindo possíveis cupons de desconto e taxa de entrega, além do tempo médio de espera."}
-        ]
-
-    # Adiciona a mensagem do usuário ao histórico
+        prompt = definir_prompt(modo_fala)
+        context.user_data['conversation_history'] = [{"role": "system", "content": prompt}]
+    
     context.user_data['conversation_history'].append({"role": "user", "content": user_message})
+    resposta = await get_openrouter_response(context.user_data['conversation_history'])
+    context.user_data['conversation_history'].append({"role": "assistant", "content": resposta})
+    await update.message.reply_text(resposta)
+#funcao para mostrar o resumo final
+async def mostrar_resumo_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pedido = context.user_data['pedido']
+    endereco = context.user_data.get('endereco', 'Não informado')
+    forma_pagamento = context.user_data.get('forma_pagamento', 'Não informada')
+    cupom_valido = context.user_data.get('cupom_valido', False)
+    
+    subtotal, desconto, taxa_entrega, total = calcular_total(pedido, cupom_valido)
+    
+    resposta = " *PEDIDO CONFIRMADO!* \n\n"
+    resposta += " *Itens do Pedido:*\n"
+    
+    contagem_pedido = {}
+    for item in pedido:
+        if item['nome'] in contagem_pedido:
+            contagem_pedido[item['nome']] += 1
+        else:
+            contagem_pedido[item['nome']] = 1
+    
+    for item, quantidade in contagem_pedido.items():
+        preco_item = next((i['preco'] for categoria in cardapio.values() for i in categoria if i['nome'] == item), 0)
+        resposta += f"- {quantidade}x {item}: R$ {preco_item:.2f} (R$ {preco_item * quantidade:.2f})\n"
+    
+    resposta += (
+        f"\n💵 *Valores:*\n"
+        f"Subtotal: R$ {subtotal:.2f}\n"
+        f"Desconto: R$ {desconto:.2f}\n"
+        f"Taxa de Entrega: R$ {taxa_entrega:.2f}\n"
+        f"*Total: R$ {total:.2f}*\n\n"
+        f" *Endereço para entrega:*\n{endereco}\n\n"
+        f"*Forma de pagamento:*\n{forma_pagamento}\n\n"
+        " *Prazo de entrega:*\n30 minutos\n\n"
+        "O entregador Wallan já está a caminho! \n"
+        "Obrigado por pedir na BSI Lanches!"
+    )
+    
+    await update.message.reply_text(resposta, parse_mode="Markdown")
+    
+    # Limpa os dados do pedido para um novo
+    context.user_data.pop('pedido', None)
+    context.user_data.pop('cupom_valido', None)
+    context.user_data.pop('endereco', None)
+    context.user_data.pop('forma_pagamento', None)
+    context.user_data['estado_pedido'] = AGUARDANDO_PEDIDO
 
-    # Obtém a resposta da API
-    response = await get_openrouter_response(context.user_data['conversation_history'])
-
-    # Adiciona a resposta do assistente ao histórico
-    context.user_data['conversation_history'].append({"role": "assistant", "content": response})
-
-    # Envia a resposta para o usuário
-    await update.message.reply_text(response)
-
-# Função principal
+# startando o botzin sabido
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("TUDO CERTO, SÓ METER BALAAAA")
+    app.run_polling()
 
-    # Handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Inicia o bot
-    application.run_polling()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
