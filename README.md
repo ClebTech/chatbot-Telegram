@@ -21,3 +21,5 @@
 - Variáveis de ambiente gerenciadas com python-dotenv
 
 ### Projeto feito com fins didáticos para a disciplina de Introdução à Inteligência Computacional (IIC), ministrada pelo professor Dr. Felipe Augusto Oliveira Mota no 6º período do curso de Bacharelado em Sistemas de Informação no IFNMG - Campus Januária.
+
+<img width="873" height="809" alt="Image" src="https://github.com/user-attachments/assets/3918ea54-67f9-4f50-bb7b-1484b90f2710" />
