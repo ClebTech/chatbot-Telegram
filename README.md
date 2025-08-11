@@ -19,3 +19,5 @@
 - pandas para manipulação da base de gírias
 - API OpenRouter para respostas inteligentes do bot (modelo GPT-3.5-turbo)
 - Variáveis de ambiente gerenciadas com python-dotenv
+
+### Projeto feito com fins didádicos para a disciplina de Introdução à Inteligência Computacional (IIC), ministrada pelo Professor Dr. Felipe Augusto Oliveira Mota no 6º período do curso de Bacharelado em Sistemas de Informação no IFNMG - Campus Januária
